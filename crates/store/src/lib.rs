@@ -16,7 +16,7 @@ pub use favorites::Favorite;
 pub use macros::Macro;
 pub use model::{
     BufferState, DbConnection, EnvironmentLabel, FileConnection, FileProtocol, ForwardDirection,
-    FtpMode, FtpTls, Host, HostPatch, PortForward, Profile, ProfileId, SecretRef, SshAuth,
+    FtpMode, FtpTls, Host, HostPatch, PortForward, Profile, ProfileId, S3Auth, SecretRef, SshAuth,
     TerminalColors, TerminalProfile, ValidationError, Workspace,
 };
 pub use paths::AppPaths;

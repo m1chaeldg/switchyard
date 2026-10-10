@@ -1,0 +1,59 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Switchyard App (CodeLLDB)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=switchyard", "--package=switchyard-app"]
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "SWITCHYARD_LOG": "debug",
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "name": "Debug Switchyard App (MSVC C++ Debugger)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/switchyard.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        { "name": "SWITCHYARD_LOG", "value": "debug" },
+        { "name": "RUST_BACKTRACE", "value": "1" }
+      ],
+      "preLaunchTask": "cargo build (switchyard-app)"
+    },
+    {
+      "name": "Debug swy CLI (CodeLLDB)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": ["build", "--bin=swy", "--package=switchyard-cli"]
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_BACKTRACE": "1"
+      }
+    },
+    {
+      "name": "Debug swy CLI (MSVC C++ Debugger)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/swy.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        { "name": "RUST_BACKTRACE", "value": "1" }
+      ],
+      "preLaunchTask": "cargo build (switchyard-cli)"
+    }
+  ]
+}

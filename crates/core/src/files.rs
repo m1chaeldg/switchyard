@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use switchyard_remote::fs::file_name;
-use switchyard_remote::{FileEntry, FsError, FtpFs, RemoteFs, SftpFs};
+use switchyard_remote::{FileEntry, FsError, FtpFs, RemoteFs, S3Fs, SftpFs};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::bus::{OnConflict, SaveError, TextFile, TransferError};
@@ -33,6 +33,8 @@ pub(crate) struct Files {
     pub(crate) sftp: tokio::sync::Mutex<HashMap<String, Arc<SftpFs>>>,
     /// FTP / FTPS file systems by file connection id.
     pub(crate) ftp: tokio::sync::Mutex<HashMap<String, Arc<FtpFs>>>,
+    /// S3 file systems by file connection id.
+    pub(crate) s3: tokio::sync::Mutex<HashMap<String, Arc<S3Fs>>>,
     controls: Mutex<HashMap<u64, Control>>,
     pub(crate) slots: Arc<tokio::sync::Semaphore>,
 }
@@ -42,6 +44,7 @@ impl Default for Files {
         Self {
             sftp: tokio::sync::Mutex::default(),
             ftp: tokio::sync::Mutex::default(),
+            s3: tokio::sync::Mutex::default(),
             controls: Mutex::default(),
             slots: Arc::new(tokio::sync::Semaphore::new(PARALLEL_TRANSFERS)),
         }
@@ -420,6 +423,132 @@ pub(crate) async fn write_text(
     Ok(fs.stat(path).await.ok().and_then(|m| m.modified_ms))
 }
 
+/// Statistics from a folder sync operation.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    /// Number of files scanned and compared.
+    pub files_checked: usize,
+    /// Number of files copied.
+    pub files_transferred: usize,
+    /// Total bytes copied.
+    pub bytes_transferred: u64,
+}
+
+/// Helper to scan a folder recursively, returning relative paths and entries.
+async fn collect_file_tree(
+    fs: &dyn RemoteFs,
+    posix: bool,
+    base: &Path,
+    rel: &Path,
+) -> Result<Vec<(PathBuf, FileEntry)>, FsError> {
+    let full = if rel.as_os_str().is_empty() {
+        base.to_path_buf()
+    } else {
+        child(base, &rel.to_string_lossy().replace('\\', "/"), posix)
+    };
+
+    let entries = fs.list(&full).await?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let child_rel = if rel.as_os_str().is_empty() {
+            PathBuf::from(&entry.name)
+        } else if posix {
+            PathBuf::from(format!("{}/{}", rel.to_string_lossy().replace('\\', "/"), entry.name))
+        } else {
+            rel.join(&entry.name)
+        };
+
+        if entry.is_dir() {
+            let mut sub = Box::pin(collect_file_tree(fs, posix, base, &child_rel)).await?;
+            out.append(&mut sub);
+        } else {
+            out.push((child_rel, entry));
+        }
+    }
+    Ok(out)
+}
+
+/// Synchronize a folder from `src` to `dst` directionally, only copying missing or newer/different files.
+pub(crate) async fn sync_folder(
+    src: &dyn RemoteFs,
+    src_posix: bool,
+    src_dir: &Path,
+    dst: &dyn RemoteFs,
+    dst_posix: bool,
+    dst_dir: &Path,
+    control: &AtomicU8,
+    progress: &(dyn Fn(u64, Option<u64>) + Send + Sync),
+) -> Result<SyncReport, TransferError> {
+    let fail = |e: FsError| TransferError::Failed(e.to_string());
+    let src_files = collect_file_tree(src, src_posix, src_dir, Path::new("")).await.map_err(fail)?;
+
+    let mut report = SyncReport {
+        files_checked: src_files.len(),
+        files_transferred: 0,
+        bytes_transferred: 0,
+    };
+
+    for (rel_path, src_entry) in src_files {
+        match control.load(Ordering::SeqCst) {
+            CANCEL => return Err(TransferError::Cancelled),
+            PAUSE => return Err(TransferError::Paused),
+            _ => {}
+        }
+
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+        let dst_target = child(dst_dir, &rel_str, dst_posix);
+
+        // Check if destination file exists and whether it needs copying
+        let needs_copy = match dst.stat(&dst_target).await {
+            Ok(dst_entry) => {
+                if dst_entry.is_dir() {
+                    true
+                } else if dst_entry.size != src_entry.size {
+                    true
+                } else {
+                    match (src_entry.modified_ms, dst_entry.modified_ms) {
+                        (Some(sm), Some(dm)) => sm > dm,
+                        _ => false,
+                    }
+                }
+            }
+            Err(_) => true,
+        };
+
+        if needs_copy {
+            // Ensure parent directory exists on dst
+            if let Some(parent) = rel_path.parent() {
+                let parent_str = parent.to_string_lossy().replace('\\', "/");
+                if !parent_str.is_empty() {
+                    let parent_target = child(dst_dir, &parent_str, dst_posix);
+                    if !exists(dst, &parent_target).await {
+                        let _ = dst.mkdir(&parent_target).await;
+                    }
+                }
+            }
+
+            let src_target = child(src_dir, &rel_str, src_posix);
+            let mut copy = Copy {
+                src,
+                dst,
+                src_posix,
+                dst_posix,
+                control,
+                done: report.bytes_transferred,
+                report: &|done| progress(done, None),
+                resuming: false,
+            };
+
+            copy.file(&src_target, &dst_target, src_entry.size).await?;
+            report.files_transferred += 1;
+            report.bytes_transferred += src_entry.size;
+            progress(report.bytes_transferred, None);
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -710,5 +839,72 @@ mod tests {
                 .unwrap_err()
                 .contains("binary")
         );
+    }
+
+    #[tokio::test]
+    async fn sync_folder_directional_logic() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("source");
+        let dst = t.path().join("dest");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("nested/b.txt"), b"world 123").unwrap();
+
+        let fs = LocalFs;
+        let control = TransferControl::default();
+        let report = sync_folder(
+            &fs,
+            false,
+            &src,
+            &fs,
+            false,
+            &dst,
+            &control,
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.files_copied, 2);
+        assert_eq!(report.files_skipped, 0);
+        assert_eq!(report.bytes_transferred, 14);
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(dst.join("nested/b.txt")).unwrap(), b"world 123");
+
+        // Sync again without changes - should skip both files
+        let report2 = sync_folder(
+            &fs,
+            false,
+            &src,
+            &fs,
+            false,
+            &dst,
+            &control,
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(report2.files_copied, 0);
+        assert_eq!(report2.files_skipped, 2);
+
+        // Update one file in source
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(src.join("a.txt"), b"hello updated!").unwrap();
+
+        let report3 = sync_folder(
+            &fs,
+            false,
+            &src,
+            &fs,
+            false,
+            &dst,
+            &control,
+            &|_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(report3.files_copied, 1);
+        assert_eq!(report3.files_skipped, 1);
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"hello updated!");
     }
 }

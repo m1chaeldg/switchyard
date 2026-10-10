@@ -860,6 +860,24 @@ impl Workspace {
                 window.focus(&self.overlay_focus, cx);
                 cx.notify();
             }
+            Event::FolderSynced {
+                files_checked,
+                files_transferred,
+                bytes_transferred,
+                error,
+                ..
+            } => {
+                if let Some(err) = error {
+                    self.toast(format!("Folder sync error: {err}"), cx);
+                } else {
+                    self.toast(
+                        format!(
+                            "Sync complete: {files_transferred} transferred of {files_checked} checked ({bytes_transferred} bytes)"
+                        ),
+                        cx,
+                    );
+                }
+            }
             Event::Error { context, message } => self.toast(format!("{context}: {message}"), cx),
         }
         if let Some(id) = self.pending_open.clone()
@@ -1588,7 +1606,7 @@ impl Workspace {
             Some(Tab::Terminal(t)) => t.read(cx).host().cloned(),
             Some(Tab::Editor(e)) => match &e.read(cx).fs {
                 FsRef::Host(h) => Some(h.clone()),
-                FsRef::Local | FsRef::Ftp(_) => None,
+                FsRef::Local | FsRef::Ftp(_) | FsRef::S3(_) => None,
             },
             Some(Tab::Files(f)) => f.read(cx).right_host().cloned(),
             _ => None,
@@ -1645,7 +1663,7 @@ impl Workspace {
                 .host(h)
                 .map(|h| (h.name.clone(), h.environment))
                 .unwrap_or_default(),
-            FsRef::Ftp(id) => self
+            FsRef::Ftp(id) | FsRef::S3(id) => self
                 .profiles
                 .all
                 .iter()
@@ -1672,15 +1690,19 @@ impl Workspace {
             .profiles
             .hosts()
             .map(|h| (FsRef::Host(h.id.clone()), h.name.clone()));
-        let ftp = self.profiles.all.iter().filter_map(|p| match p {
-            Profile::File(f)
-                if matches!(f.protocol, switchyard_core::store::FileProtocol::Ftp { .. }) =>
-            {
-                Some((FsRef::Ftp(f.id.clone()), f.name.clone()))
-            }
+        let remote_files = self.profiles.all.iter().filter_map(|p| match p {
+            Profile::File(f) => match &f.protocol {
+                switchyard_core::store::FileProtocol::Ftp { .. } => {
+                    Some((FsRef::Ftp(f.id.clone()), f.name.clone()))
+                }
+                switchyard_core::store::FileProtocol::S3 { .. } => {
+                    Some((FsRef::S3(f.id.clone()), f.name.clone()))
+                }
+                _ => None,
+            },
             _ => None,
         });
-        hosts.chain(ftp).collect()
+        hosts.chain(remote_files).collect()
     }
 
     /// The Files tab, with `host` on the right (or what it already shows).
@@ -1792,6 +1814,9 @@ impl Workspace {
                 }
                 switchyard_core::store::FileProtocol::Ftp { .. } => {
                     self.open_files_on(Some(FsRef::Ftp(f.id.clone())), cx)
+                }
+                switchyard_core::store::FileProtocol::S3 { .. } => {
+                    self.open_files_on(Some(FsRef::S3(f.id.clone())), cx)
                 }
             },
             Some(Profile::Terminal(t)) => self.open_terminal(t.host_id, cx),
@@ -2563,7 +2588,7 @@ impl Workspace {
             Tab::Files(f) => {
                 let right = match f.read(cx).right_source() {
                     FsRef::Local => "local".to_owned(),
-                    FsRef::Host(id) | FsRef::Ftp(id) => self
+                    FsRef::Host(id) | FsRef::Ftp(id) | FsRef::S3(id) => self
                         .profiles
                         .all
                         .iter()

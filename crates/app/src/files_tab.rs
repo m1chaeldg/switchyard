@@ -239,7 +239,7 @@ impl FilesTab {
     pub fn right_host(&self) -> Option<&ProfileId> {
         match &self.panes[1].fs {
             FsRef::Host(h) => Some(h),
-            FsRef::Local | FsRef::Ftp(_) => None,
+            FsRef::Local | FsRef::Ftp(_) | FsRef::S3(_) => None,
         }
     }
 
@@ -856,6 +856,7 @@ impl FilesTab {
                 .child(match pane.fs {
                     FsRef::Host(_) => "Opening SFTP on the Host's session…",
                     FsRef::Ftp(_) => "Connecting to the FTP server…",
+                    FsRef::S3(_) => "Connecting to S3…",
                     FsRef::Local => "Loading…",
                 })
                 .into_any_element()
@@ -995,6 +996,7 @@ impl FilesTab {
                             FsRef::Local => "FS",
                             FsRef::Host(_) => "SSH",
                             FsRef::Ftp(_) => "FTP",
+                            FsRef::S3(_) => "S3",
                         };
                         div()
                             .id(SharedString::from(format!("files-pick-{i}")))

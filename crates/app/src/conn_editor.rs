@@ -17,7 +17,7 @@ use switchyard_core::db::Engine;
 use switchyard_core::drivers::{Component, ComponentStatus};
 use switchyard_core::store::{
     EnvironmentLabel, FileConnection, FileProtocol, FtpMode, FtpTls, Host, Profile, ProfileId,
-    SshAuth, TerminalColors,
+    S3Auth, SshAuth, TerminalColors,
 };
 use switchyard_core::{Command, RequestId, RuntimeHandle};
 
@@ -42,15 +42,18 @@ pub enum ConnKind {
     Sftp,
     /// FTP / FTPS.
     Ftp,
+    /// Amazon S3 / S3-compatible object storage.
+    S3,
 }
 
 impl ConnKind {
     /// The rail's entries: one for every database engine, then the remote kinds.
-    const RAIL: [ConnKind; 4] = [
+    const RAIL: [ConnKind; 5] = [
         ConnKind::Db(Engine::Postgres),
         ConnKind::Ssh,
         ConnKind::Sftp,
         ConnKind::Ftp,
+        ConnKind::S3,
     ];
 
     /// Whether `self` and `other` share a rail entry.
@@ -67,6 +70,7 @@ impl ConnKind {
             ConnKind::Ssh => "SSH",
             ConnKind::Sftp => "SFTP",
             ConnKind::Ftp => "FTP",
+            ConnKind::S3 => "S3",
         }
     }
 
@@ -76,6 +80,7 @@ impl ConnKind {
             ConnKind::Ssh => "SSH Host",
             ConnKind::Sftp => "SFTP",
             ConnKind::Ftp => "FTP / FTPS",
+            ConnKind::S3 => "Amazon S3",
         }
     }
 
@@ -106,6 +111,7 @@ impl ConnKind {
             ConnKind::Ssh => "Terminal + tunnels",
             ConnKind::Sftp => "Files over a Host",
             ConnKind::Ftp => "Files, own login",
+            ConnKind::S3 => "Buckets & objects",
         }
     }
 }
@@ -202,6 +208,7 @@ impl ConnEditor {
             Some(Profile::File(f)) => match f.protocol {
                 FileProtocol::Sftp { .. } => ConnKind::Sftp,
                 FileProtocol::Ftp { .. } => ConnKind::Ftp,
+                FileProtocol::S3 { .. } => ConnKind::S3,
             },
             _ => kind,
         };
@@ -551,6 +558,78 @@ impl ConnEditor {
                     ),
                 );
             }
+            ConnKind::S3 => {
+                let (name, region, bucket, endpoint, path_style, auth_type, profile, access_key, path) = match existing {
+                    Some(Profile::File(FileConnection {
+                        name,
+                        protocol:
+                            FileProtocol::S3 {
+                                region,
+                                bucket,
+                                endpoint,
+                                force_path_style,
+                                auth,
+                            },
+                        default_path,
+                        ..
+                    })) => {
+                        let (auth_type, prof, key) = match auth {
+                            S3Auth::Profile { profile } => ("profile", profile.clone(), String::new()),
+                            S3Auth::Credentials { access_key_id, .. } => ("credentials", "default".to_string(), access_key_id.clone()),
+                        };
+                        (
+                            name.clone(),
+                            region.clone(),
+                            bucket.clone().unwrap_or_default(),
+                            endpoint.clone().unwrap_or_default(),
+                            *force_path_style,
+                            auth_type,
+                            prof,
+                            key,
+                            default_path.clone().unwrap_or_default(),
+                        )
+                    }
+                    _ => (
+                        String::new(),
+                        "us-east-1".to_string(),
+                        String::new(),
+                        String::new(),
+                        false,
+                        "profile",
+                        "default".to_string(),
+                        String::new(),
+                        String::new(),
+                    ),
+                };
+                add(self, "name", &name, "prod-s3-storage", false);
+                add(self, "region", &region, "us-east-1", false);
+                add(self, "bucket", &bucket, "my-bucket (empty for all)", false);
+                add(self, "endpoint", &endpoint, "https://s3.amazonaws.com (optional)", false);
+                add(self, "profile", &profile, "default", false);
+                add(self, "access_key_id", &access_key, "AKIAIOSFODNN7EXAMPLE", false);
+                add(self, "password", "", "Secret Access Key", true);
+                add(self, "path", &path, "/prefix or empty", false);
+                self.selects.insert(
+                    "auth_type",
+                    sel(
+                        vec![
+                            ("AWS Profile (~/.aws/)".into(), "profile".into()),
+                            ("Access Key & Secret".into(), "credentials".into()),
+                        ],
+                        auth_type,
+                    ),
+                );
+                self.selects.insert(
+                    "path_style",
+                    sel(
+                        vec![
+                            ("Virtual-host style (bucket.s3...)".into(), "virtual".into()),
+                            ("Path style (MinIO / R2 / LocalStack)".into(), "path".into()),
+                        ],
+                        if path_style { "path" } else { "virtual" },
+                    ),
+                );
+            }
         }
         if self.kind.is_sql() {
             let chosen = match existing {
@@ -763,6 +842,42 @@ impl ConnEditor {
                 folder: None,
                 secret: existing.and_then(|p| p.secret().cloned()),
             }),
+            ConnKind::S3 => Profile::File(FileConnection {
+                id,
+                name: self.value("name", cx),
+                protocol: FileProtocol::S3 {
+                    region: {
+                        let r = self.value("region", cx);
+                        if r.is_empty() {
+                            "us-east-1".to_string()
+                        } else {
+                            r
+                        }
+                    },
+                    bucket: Some(self.value("bucket", cx)).filter(|b| !b.is_empty()),
+                    endpoint: Some(self.value("endpoint", cx)).filter(|e| !e.is_empty()),
+                    force_path_style: self.chosen("path_style") == "path",
+                    auth: if self.chosen("auth_type") == "credentials" {
+                        S3Auth::Credentials {
+                            access_key_id: self.value("access_key_id", cx),
+                            session_token: None,
+                        }
+                    } else {
+                        let prof = self.value("profile", cx);
+                        S3Auth::Profile {
+                            profile: if prof.is_empty() {
+                                "default".to_string()
+                            } else {
+                                prof
+                            },
+                        }
+                    },
+                },
+                default_path: Some(self.value("path", cx)).filter(|p| !p.is_empty()),
+                environment: self.env,
+                folder: None,
+                secret: existing.and_then(|p| p.secret().cloned()),
+            }),
         })
     }
 
@@ -824,7 +939,7 @@ impl ConnEditor {
             (ConnKind::Sftp, Ok(_)) => {
                 self.test = TestState::Failed("SFTP ships in milestone M4 (russh-sftp)".into())
             }
-            (ConnKind::Ftp, Ok(Profile::File(connection))) => {
+            (ConnKind::Ftp | ConnKind::S3, Ok(Profile::File(connection))) => {
                 let request = next_id();
                 self.test = TestState::Testing(request);
                 self.core.send(Command::TestFiles {
@@ -1246,6 +1361,26 @@ impl ConnEditor {
                     Field::new("path", "Default remote path")
                         .mono()
                         .hint("Empty: the login folder"),
+                );
+            }
+            ConnKind::S3 => {
+                v.push(Field::new("name", "Name"));
+                v.push(Field::new("auth_type", "Authentication").span(3));
+                v.push(Field::new("region", "Region").span(3).mono().hint("e.g. us-east-1"));
+                let is_profile = self.chosen("auth_type") != "credentials";
+                if is_profile {
+                    v.push(Field::new("profile", "AWS Profile").span(6).hint("Profile name from ~/.aws/credentials"));
+                } else {
+                    v.push(Field::new("access_key_id", "Access Key ID").span(3).mono());
+                    v.push(Field::new("password", "Secret Access Key").span(3));
+                }
+                v.push(Field::new("bucket", "Bucket").span(3).mono().hint("Leave empty to list all accessible buckets"));
+                v.push(Field::new("path_style", "Addressing Style").span(3));
+                v.push(Field::new("endpoint", "Endpoint URL").span(6).mono().hint("Optional: e.g. http://localhost:9000 or Cloudflare R2"));
+                v.push(
+                    Field::new("path", "Default Prefix / Path")
+                        .mono()
+                        .hint("Optional initial folder or prefix"),
                 );
             }
         }

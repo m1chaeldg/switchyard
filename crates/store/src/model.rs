@@ -608,6 +608,42 @@ pub enum FileProtocol {
         /// User.
         user: String,
     },
+    /// AWS S3 or S3-compatible object storage.
+    S3 {
+        /// AWS Region (e.g. "us-east-1").
+        region: String,
+        /// Specific bucket to scope to, or None to list all accessible buckets.
+        #[serde(default)]
+        bucket: Option<String>,
+        /// Optional custom endpoint URL (e.g. MinIO, LocalStack, Cloudflare R2).
+        #[serde(default)]
+        endpoint: Option<String>,
+        /// Force path-style addressing (`http://endpoint/bucket/key`).
+        #[serde(default)]
+        force_path_style: bool,
+        /// Authentication method: AWS profile or Access Key credentials.
+        auth: S3Auth,
+    },
+}
+
+/// Authentication method for S3 connections.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum S3Auth {
+    /// AWS named profile from ~/.aws/credentials and ~/.aws/config.
+    Profile {
+        /// Profile name (e.g. "default").
+        profile: String,
+    },
+    /// Static AWS credentials (Access Key ID and optional Session Token).
+    /// The Secret Access Key is stored in `FileConnection.secret`.
+    Credentials {
+        /// AWS Access Key ID.
+        access_key_id: String,
+        /// Optional session token for temporary credentials.
+        #[serde(default)]
+        session_token: Option<String>,
+    },
 }
 
 /// A file-transfer endpoint.
@@ -1007,11 +1043,10 @@ impl Profile {
                     ));
                 }
             }
-            Profile::File(f) => {
-                if let FileProtocol::Ftp {
+            Profile::File(f) => match &f.protocol {
+                FileProtocol::Ftp {
                     server, port, user, ..
-                } = &f.protocol
-                {
+                } => {
                     if server.trim().is_empty() {
                         return Err(ValidationError::new("server", "Server is required"));
                     }
@@ -1022,7 +1057,31 @@ impl Profile {
                         return Err(ValidationError::new("user", "User is required"));
                     }
                 }
-            }
+                FileProtocol::S3 { region, auth, .. } => {
+                    if region.trim().is_empty() {
+                        return Err(ValidationError::new("region", "Region is required"));
+                    }
+                    match auth {
+                        S3Auth::Profile { profile } => {
+                            if profile.trim().is_empty() {
+                                return Err(ValidationError::new(
+                                    "profile",
+                                    "AWS profile name is required",
+                                ));
+                            }
+                        }
+                        S3Auth::Credentials { access_key_id, .. } => {
+                            if access_key_id.trim().is_empty() {
+                                return Err(ValidationError::new(
+                                    "access_key_id",
+                                    "AWS Access Key ID is required",
+                                ));
+                            }
+                        }
+                    }
+                }
+                FileProtocol::Sftp { .. } => {}
+            },
             Profile::Terminal(_) => {}
         }
         Ok(())
@@ -1035,7 +1094,7 @@ impl Profile {
             Profile::Db(d) => d.via_host.iter().collect(),
             Profile::File(f) => match &f.protocol {
                 FileProtocol::Sftp { host_id } => vec![host_id],
-                FileProtocol::Ftp { .. } => vec![],
+                FileProtocol::Ftp { .. } | FileProtocol::S3 { .. } => vec![],
             },
             Profile::Terminal(t) => t.host_id.iter().collect(),
         }

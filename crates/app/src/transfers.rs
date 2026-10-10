@@ -103,7 +103,7 @@ fn part_path(it: &Item) -> Option<PathBuf> {
     };
     let name = format!("{}{}", it.name, ".swypart");
     Some(match it.to {
-        FsRef::Host(_) | FsRef::Ftp(_) => {
+        FsRef::Host(_) | FsRef::Ftp(_) | FsRef::S3(_) => {
             let d = dir.to_string_lossy().replace('\\', "/");
             PathBuf::from(format!("{}/{name}", d.trim_end_matches('/')))
         }

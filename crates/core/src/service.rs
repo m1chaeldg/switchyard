@@ -998,6 +998,32 @@ impl Service {
                 self.files.finish(id);
                 self.emit(Event::TransferDone { id, result });
             }
+            Command::SyncFolder {
+                id,
+                from,
+                src,
+                to,
+                dst,
+            } => {
+                let result = self.sync_folder(id, &from, &src, &to, &dst).await;
+                self.files.finish(id);
+                match result {
+                    Ok(rep) => self.emit(Event::FolderSynced {
+                        id,
+                        files_checked: rep.files_checked,
+                        files_transferred: rep.files_transferred,
+                        bytes_transferred: rep.bytes_transferred,
+                        error: None,
+                    }),
+                    Err(e) => self.emit(Event::FolderSynced {
+                        id,
+                        files_checked: 0,
+                        files_transferred: 0,
+                        bytes_transferred: 0,
+                        error: Some(format!("{e:?}")),
+                    }),
+                }
+            }
             Command::CancelTransfer { id } => self.files.cancel(id),
             Command::PauseTransfer { id } => self.files.pause(id),
             Command::FsOp { request, fs, op } => {
@@ -1186,6 +1212,7 @@ impl Service {
             crate::bus::FsRef::Local => return Ok((Arc::new(LocalFs), cfg!(unix))),
             crate::bus::FsRef::Host(id) => id,
             crate::bus::FsRef::Ftp(id) => return Ok((self.ftp_fs(id).await?, true)),
+            crate::bus::FsRef::S3(id) => return Ok((self.s3_fs(id).await?, true)),
         };
         let mut open = self.files.sftp.lock().await;
         if let Some(f) = open.get(&id.0)
@@ -1224,6 +1251,85 @@ impl Service {
         Ok(f)
     }
 
+    /// The S3 file system of a saved file connection, configured and reused.
+    async fn s3_fs(&self, id: &ProfileId) -> Result<Arc<dyn switchyard_remote::RemoteFs>> {
+        let mut open = self.files.s3.lock().await;
+        if let Some(f) = open.get(&id.0) {
+            return Ok(f.clone());
+        }
+        let id2 = id.clone();
+        let Some(Profile::File(conn)) = self.with_store(move |s| s.profile(&id2)).await? else {
+            return Err(CoreError::NotFound(format!("file connection {}", id.0)));
+        };
+        let f = Arc::new(self.s3_connect(&conn).await?);
+        open.insert(id.0.clone(), f.clone());
+        Ok(f)
+    }
+
+    /// Construct an S3Fs for an S3 file connection.
+    async fn s3_connect(&self, c: &FileConnection) -> Result<switchyard_remote::S3Fs> {
+        use secrecy::ExposeSecret as _;
+        use switchyard_remote::{AwsCredentials, S3Config, S3Fs, load_aws_profile};
+        use switchyard_store::{FileProtocol, S3Auth};
+
+        let FileProtocol::S3 {
+            region,
+            bucket,
+            endpoint,
+            force_path_style,
+            auth,
+        } = &c.protocol
+        else {
+            return Err(CoreError::Unsupported(format!(
+                "{} is not an S3 connection",
+                c.name
+            )));
+        };
+
+        let (creds, resolved_region) = match auth {
+            S3Auth::Profile { profile } => {
+                let (creds, reg) = load_aws_profile(profile)
+                    .map_err(|e| CoreError::Unsupported(e.to_string()))?;
+                (creds, reg)
+            }
+            S3Auth::Credentials {
+                access_key_id,
+                session_token,
+            } => {
+                let secret_key = match c.secret.clone() {
+                    Some(key) => self
+                        .with_secrets(move |s| s.get(&key))
+                        .await?
+                        .map(|s| s.expose_secret().to_string())
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
+                let creds = AwsCredentials {
+                    access_key_id: access_key_id.clone(),
+                    secret_access_key: secret_key,
+                    session_token: session_token.clone(),
+                };
+                (creds, None)
+            }
+        };
+
+        let effective_region = if region.trim().is_empty() {
+            resolved_region.unwrap_or_else(|| "us-east-1".to_string())
+        } else {
+            region.clone()
+        };
+
+        let cfg = S3Config {
+            region: effective_region,
+            bucket: bucket.clone(),
+            endpoint: endpoint.clone(),
+            force_path_style: *force_path_style,
+            credentials: creds,
+        };
+
+        Ok(S3Fs::new(cfg))
+    }
+
     /// Log in to an FTP file connection (`secret` overrides the stored password).
     async fn ftp_connect(
         &self,
@@ -1241,7 +1347,7 @@ impl Service {
         } = &c.protocol
         else {
             return Err(CoreError::Unsupported(format!(
-                "{} is an SFTP connection",
+                "{} is not an FTP connection",
                 c.name
             )));
         };
@@ -1277,19 +1383,38 @@ impl Service {
     }
 
     async fn test_files(&self, c: FileConnection, secret: Option<SecretString>) -> Result<String> {
+        use switchyard_store::FileProtocol;
         let started = Instant::now();
-        let fs = self.ftp_connect(&c, secret).await?;
-        let listed = fs
-            .list(&fs.home())
-            .await
-            .map_err(|e| CoreError::Unsupported(format!("Listing {}: {e}", fs.home().display())))?;
-        Ok(format!(
-            "Connected · {} · {} entries in {} · {} ms",
-            fs.describe(),
-            listed.len(),
-            fs.home().display(),
-            started.elapsed().as_millis()
-        ))
+        match &c.protocol {
+            FileProtocol::S3 { .. } => {
+                let fs = self.s3_connect(&c).await?;
+                let listed = fs
+                    .list(&fs.home())
+                    .await
+                    .map_err(|e| CoreError::Unsupported(format!("Listing S3 {}: {e}", fs.home().display())))?;
+                Ok(format!(
+                    "Connected to S3 · {} entries in {} · {} ms",
+                    listed.len(),
+                    fs.home().display(),
+                    started.elapsed().as_millis()
+                ))
+            }
+            FileProtocol::Ftp { .. } => {
+                let fs = self.ftp_connect(&c, secret).await?;
+                let listed = fs
+                    .list(&fs.home())
+                    .await
+                    .map_err(|e| CoreError::Unsupported(format!("Listing {}: {e}", fs.home().display())))?;
+                Ok(format!(
+                    "Connected · {} · {} entries in {} · {} ms",
+                    fs.describe(),
+                    listed.len(),
+                    fs.home().display(),
+                    started.elapsed().as_millis()
+                ))
+            }
+            FileProtocol::Sftp { .. } => Err(CoreError::Unsupported("SFTP tested via Host".into())),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1356,6 +1481,48 @@ impl Service {
             &dir,
             on_conflict,
             resume,
+            &control,
+            &progress,
+        )
+        .await
+    }
+
+    async fn sync_folder(
+        &self,
+        id: u64,
+        from: &crate::bus::FsRef,
+        src_path: &std::path::Path,
+        to: &crate::bus::FsRef,
+        dst_path: &std::path::Path,
+    ) -> std::result::Result<crate::files::SyncReport, crate::bus::TransferError> {
+        let (src, src_posix) = self
+            .file_system(from)
+            .await
+            .map_err(|e| crate::bus::TransferError::Failed(e.to_string()))?;
+        let (dst, dst_posix) = self
+            .file_system(to)
+            .await
+            .map_err(|e| crate::bus::TransferError::Failed(e.to_string()))?;
+
+        let control = self.files.start(id);
+        let name = switchyard_remote::fs::file_name(src_path);
+        let events = self.events.clone();
+        let progress = move |done: u64, total: Option<u64>| {
+            events.emit(Event::TransferProgress {
+                id,
+                name: name.clone(),
+                done,
+                total,
+            });
+        };
+
+        crate::files::sync_folder(
+            src.as_ref(),
+            src_posix,
+            src_path,
+            dst.as_ref(),
+            dst_posix,
+            dst_path,
             &control,
             &progress,
         )

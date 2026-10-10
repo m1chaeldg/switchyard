@@ -87,13 +87,13 @@ impl Profiles {
             .collect()
     }
 
-    /// Profiles not attached to a Host (direct databases, FTP, local terminals).
+    /// Profiles not attached to a Host (direct databases, FTP, S3, local terminals).
     pub fn direct(&self) -> Vec<&Profile> {
         self.all
             .iter()
             .filter(|p| match p {
                 Profile::Db(d) => d.via_host.is_none(),
-                Profile::File(f) => matches!(f.protocol, FileProtocol::Ftp { .. }),
+                Profile::File(f) => matches!(f.protocol, FileProtocol::Ftp { .. } | FileProtocol::S3 { .. }),
                 Profile::Terminal(t) => t.host_id.is_none(),
                 Profile::Host(_) => false,
             })
@@ -109,6 +109,7 @@ pub fn badge_of(p: &Profile) -> &'static str {
         Profile::File(f) => match f.protocol {
             FileProtocol::Sftp { .. } => "SFTP",
             FileProtocol::Ftp { .. } => "FTP",
+            FileProtocol::S3 { .. } => "S3",
         },
         Profile::Terminal(_) => "SH",
     }
@@ -138,6 +139,10 @@ pub fn describe(p: &Profile, profiles: &Profiles) -> String {
                     switchyard_core::store::FtpTls::Implicit => "ftps · implicit",
                 }
             ),
+            FileProtocol::S3 { region, bucket, .. } => match bucket {
+                Some(b) => format!("{b} · {region}"),
+                None => format!("all buckets · {region}"),
+            },
         },
         Profile::Terminal(t) => {
             if t.shell.is_empty() {

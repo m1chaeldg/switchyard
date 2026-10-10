@@ -30,6 +30,8 @@ pub enum FsRef {
     Host(ProfileId),
     /// A saved FTP / FTPS file connection, with its own login.
     Ftp(ProfileId),
+    /// A saved AWS S3 or S3-compatible file connection.
+    S3(ProfileId),
 }
 
 impl FsRef {
@@ -613,6 +615,19 @@ pub enum Command {
         /// Transfer id.
         id: u64,
     },
+    /// Synchronize a folder from one file system to another.
+    SyncFolder {
+        /// Operation id, for progress and cancellation.
+        id: u64,
+        /// Source file system.
+        from: FsRef,
+        /// Source directory.
+        src: PathBuf,
+        /// Target file system.
+        to: FsRef,
+        /// Target directory.
+        dst: PathBuf,
+    },
     /// Create, rename or delete ([`Event::FsOpDone`]).
     FsOp {
         /// Request id.
@@ -1166,6 +1181,19 @@ pub enum Event {
         id: u64,
         /// Where it went, or why not.
         result: Result<PathBuf, TransferError>,
+    },
+    /// A folder sync operation finished ([`Command::SyncFolder`]).
+    FolderSynced {
+        /// Operation id.
+        id: u64,
+        /// Number of files evaluated.
+        files_checked: usize,
+        /// Number of files transferred.
+        files_transferred: usize,
+        /// Total bytes transferred.
+        bytes_transferred: u64,
+        /// Error message, if failed.
+        error: Option<String>,
     },
     /// Result of [`Command::FsOp`].
     FsOpDone {
