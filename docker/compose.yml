@@ -210,3 +210,17 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  localstack:
+    image: localstack/localstack:latest
+    environment:
+      - SERVICES=s3
+      - AWS_DEFAULT_REGION=us-east-1
+    ports:
+      - "127.0.0.1:4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4566/_localstack/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+

@@ -1123,7 +1123,7 @@ impl RemoteFs for S3Fs {
                 bucket: b,
                 key: k,
                 buffer: initial_data,
-                flushed: false,
+                upload_task: None,
             };
 
             Ok(Box::new(writer) as FsWriter)
@@ -1140,7 +1140,7 @@ struct S3Writer {
     bucket: String,
     key: String,
     buffer: Vec<u8>,
-    flushed: bool,
+    upload_task: Option<tokio::task::JoinHandle<Result<(), std::io::Error>>>,
 }
 
 impl tokio::io::AsyncWrite for S3Writer {
@@ -1164,29 +1164,49 @@ impl tokio::io::AsyncWrite for S3Writer {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        if self.flushed {
-            return std::task::Poll::Ready(Ok(()));
+        if self.upload_task.is_none() {
+            let fs = self.fs.clone();
+            let bucket = self.bucket.clone();
+            let key = self.key.clone();
+            let data = std::mem::take(&mut self.buffer);
+
+            let handle = tokio::spawn(async move {
+                let payload_sha = sha256_hex(&data);
+                let req = fs
+                    .build_request("PUT", Some(&bucket), Some(&key), &[], &payload_sha)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                let resp = req
+                    .body(data)
+                    .send()
+                    .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                if !resp.status().is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(std::io::Error::other(
+                        parse_s3_error(&text).unwrap_or_else(|| "failed to upload object".into()),
+                    ));
+                }
+
+                Ok(())
+            });
+            self.upload_task = Some(handle);
         }
 
-        let fs = self.fs.clone();
-        let bucket = self.bucket.clone();
-        let key = self.key.clone();
-        let data = std::mem::take(&mut self.buffer);
-        self.flushed = true;
-
-        let waker = cx.waker().clone();
-        tokio::spawn(async move {
-            let payload_sha = sha256_hex(&data);
-            let req = match fs.build_request("PUT", Some(&bucket), Some(&key), &[], &payload_sha) {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-
-            let _ = req.body(data).send().await;
-        });
-
-        waker.wake();
-        std::task::Poll::Ready(Ok(()))
+        if let Some(ref mut handle) = self.upload_task {
+            use std::future::Future;
+            match std::pin::Pin::new(handle).poll(cx) {
+                std::task::Poll::Ready(Ok(Ok(()))) => std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Ready(Ok(Err(e))) => std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Ready(Err(join_err)) => {
+                    std::task::Poll::Ready(Err(std::io::Error::other(join_err.to_string())))
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        } else {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
 }
 
